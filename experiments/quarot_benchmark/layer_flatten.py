@@ -64,7 +64,7 @@ class TimedModule(torch.nn.Module):
 # -> after inserting timer, run the inference as usual
 # -> collect data!
 
-def layer_flatten():
+def layer_flatten(batch_size, prefill_len, decode_step):
     # CONFIG
     config_name = model_configs[0]
     config = transformers.AutoConfig.from_pretrained(
@@ -73,9 +73,8 @@ def layer_flatten():
     )
     
     # PARAMS
-    batch_size = 2
-    prefill_len = 1024
-    decode_step = 512
+    num_hadamard_calls_per_layer = 2
+    num_layers = 32
     
     # GENERATE MODEL
     dtype_old = torch.get_default_dtype()
@@ -97,16 +96,18 @@ def layer_flatten():
     
     # ADD TIME MODULE AROUND THE HADAMARD LAYERS
     for i, layer in enumerate(model.model.layers):
+        
         # mlp (ffn)
         hadamard = layer.mlp.down_proj[0]
         layer.mlp.down_proj[0] = TimedModule(hadamard)
+        
         # attention 
         hadamard = layer.self_attn.o_proj_hadamard
         layer.self_attn.o_proj_hadamard = TimedModule(hadamard)
         
         # debug prints to make sure they are not repeated
-        print(f"[Layer {i}] MLP TimedModule ID:", id(layer.mlp.down_proj[0]))
-        print(f"[Layer {i}] Attn TimedModule ID:", id(layer.self_attn.o_proj_hadamard))
+        # print(f"[Layer {i}] MLP TimedModule ID:", id(layer.mlp.down_proj[0]))
+        # print(f"[Layer {i}] Attn TimedModule ID:", id(layer.self_attn.o_proj_hadamard))
     
     
     # INFERENCE (E2E TIME)
@@ -125,30 +126,47 @@ def layer_flatten():
     # CALCULATE TOTAL HADAMARD TIME
     online_hadamard_time = 0
     hadamard_call_count  = 0
+    # mlp_time = 0
+    # attn_time = 0
+    # mlp_call_count = 0
+    # attn_call_count = 0
     
-    for i, layer in enumerate(model.model.layers):
-        print(f"Layer {i} - MLP calls: {layer.mlp.down_proj[0].call_count}, "
-            f"Attn calls: {layer.self_attn.o_proj_hadamard.call_count}")
+    # for i, layer in enumerate(model.model.layers):
+    #     print(f"Layer {i} - MLP calls: {layer.mlp.down_proj[0].call_count}, "
+    #         f"Attn calls: {layer.self_attn.o_proj_hadamard.call_count}")
 
 
     for layer in model.model.layers:
+        # # MLP(ffn) hadamard
+        # timed_mlp = layer.mlp
+        # mlp_time += timed_mlp.total_time
+        # mlp_call_count  += timed_mlp.call_count
+        
         # MLP(ffn) hadamard
         timed_mlp = layer.mlp.down_proj[0]
         online_hadamard_time += timed_mlp.total_time
         hadamard_call_count  += timed_mlp.call_count
+        
+        # # attention
+        # timed_attn = layer.self_attn
+        # attn_time += timed_attn.total_time
+        # attn_call_count  += timed_attn.call_count
 
         # attention hadamard
         timed_attn = layer.self_attn.o_proj_hadamard
         online_hadamard_time += timed_attn.total_time
         hadamard_call_count  += timed_attn.call_count
     
+    
+    print("batch size: ", batch_size, " | prefill: ", prefill_len, " | decode: ", decode_step)
     avg_time_per_call = online_hadamard_time / hadamard_call_count
     print("avg hadamard time per call (ms):", avg_time_per_call)
 
-
     print("total time (ms): ", time_e2e)
+    # print("mlp average time per layer: ", mlp_time/mlp_call_count)
+    # print("attn average time per layer: ", attn_time/attn_call_count)
     
-    estimated_total_hadamard_time = avg_time_per_call * 64 * (1 + decode_step) * batch_size
+    estimated_total_hadamard_time = avg_time_per_call * num_hadamard_calls_per_layer * num_layers * (1 + decode_step)
     print("online hadamard time estimate (ms): ", estimated_total_hadamard_time)
     
     # CLEAN UP
@@ -156,4 +174,10 @@ def layer_flatten():
     _cleanup() 
     
 if __name__ == '__main__':
-    layer_flatten()  
+    batch_sizes = [1, 2, 4, 8]
+    prefill_len = 1024
+    decode_lens = [512, 1024, 1536]
+
+    for batch_size in batch_sizes:
+        for decode_len in decode_lens:
+            layer_flatten(batch_size, prefill_len, decode_len)
